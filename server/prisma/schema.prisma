@@ -1,0 +1,439 @@
+// YouTube Intelligence Agent — PostgreSQL schema.
+//
+// Public YouTube records (channels, videos, playlists) are stored ONCE, keyed by their
+// YouTube IDs, and shared by all users. Everything a user does (searches, discoveries,
+// saves, research, AI sessions, analytics) is scoped by userId.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum DataSource {
+  youtube
+  mock
+}
+
+enum SearchType {
+  PERSON
+  CHANNEL
+  CHANNEL_ID
+  HANDLE
+  VIDEO
+  PLAYLIST
+  TOPIC
+}
+
+enum SearchStatus {
+  SUCCESS
+  NO_RESULTS
+  ERROR
+  QUOTA_EXCEEDED
+  INVALID
+}
+
+enum SearchSource {
+  GLOBAL_SEARCH
+  SEARCH_PAGE
+  AI_AGENT
+  HISTORY
+  RESEARCH
+}
+
+enum ContentType {
+  VIDEO
+  SHORT
+  LIVE
+  UPCOMING
+}
+
+enum EntityKind {
+  CHANNEL
+  VIDEO
+  PLAYLIST
+}
+
+enum SavedResearchKind {
+  SEARCH
+  AI_SESSION
+  RESEARCH_SESSION
+  CREATOR
+  NOTE
+}
+
+enum EventType {
+  SEARCH
+  VIDEO_PLAY
+  VIDEO_SAVE
+  CHANNEL_SAVE
+  PLAYLIST_SAVE
+  RESEARCH_SAVE
+  RESEARCH_ADD
+  AI_SESSION
+  AI_QUERY
+  WEB_SEARCH
+}
+
+// ─── Accounts ─────────────────────────────────────────────────────────────
+model User {
+  id             String    @id @default(cuid())
+  email          String    @unique
+  name           String
+  passwordHash   String
+  sessionVersion Int       @default(0)
+  createdAt      DateTime  @default(now())
+  lastLoginAt    DateTime?
+
+  searches         SearchHistory[]
+  savedVideos      SavedVideo[]
+  savedChannels    SavedChannel[]
+  savedPlaylists   SavedPlaylist[]
+  savedResearch    SavedResearch[]
+  researchSessions ResearchSession[]
+  aiSessions       AiSession[]
+  events           AnalyticsEvent[]
+  calendar         CalendarActivity[]
+  discoveries      UserDiscovery[]
+  settings         UserSettings?
+
+  @@map("users")
+}
+
+model UserSettings {
+  userId      String   @id
+  chartColors Json
+  updatedAt   DateTime @updatedAt
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_settings")
+}
+
+// ─── Public YouTube catalog (deduplicated by YouTube ID) ──────────────────
+/// A real-world person/brand a channel belongs to (derived from searches and channel titles).
+model Person {
+  id             String    @id @default(cuid())
+  name           String
+  normalizedName String    @unique
+  createdAt      DateTime  @default(now())
+  channels       Channel[]
+
+  @@map("people")
+}
+
+model Channel {
+  id                    String     @id @default(cuid())
+  youtubeId             String     @unique
+  title                 String
+  handle                String?
+  customUrl             String?
+  description           String     @default("")
+  thumbnailUrl          String?
+  bannerUrl             String?
+  country               String?
+  publishedAt           DateTime?
+  subscriberCount       BigInt?
+  hiddenSubscriberCount Boolean    @default(false)
+  videoCount            Int?
+  viewCount             BigInt?
+  uploadsPlaylistId     String?
+  uploadsNextPageToken  String?
+  uploadsExhausted      Boolean    @default(false)
+  keywords              String?
+  topicCategories       String[]
+  dataSource            DataSource
+  fetchedAt             DateTime   @default(now())
+  createdAt             DateTime   @default(now())
+  updatedAt             DateTime   @updatedAt
+  personId              String?
+  person                Person?    @relation(fields: [personId], references: [id], onDelete: SetNull)
+  videos                Video[]
+  playlists             Playlist[]
+  saved                 SavedChannel[]
+
+  @@index([title])
+  @@index([handle])
+  @@map("channels")
+}
+
+model Video {
+  id                   String          @id @default(cuid())
+  youtubeId            String          @unique
+  channelYoutubeId     String
+  channelTitle         String
+  channelId            String?
+  channel              Channel?        @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  title                String
+  description          String          @default("")
+  thumbnailUrl         String?
+  publishedAt          DateTime?
+  durationSeconds      Int?
+  viewCount            BigInt?
+  likeCount            BigInt?
+  commentCount         BigInt?
+  tags                 String[]
+  categoryId           String?
+  categoryName         String?
+  contentType          ContentType     @default(VIDEO)
+  liveBroadcastContent String?
+  embeddable           Boolean?
+  privacyStatus        String?
+  defaultLanguage      String?
+  dataSource           DataSource
+  detailsFetchedAt     DateTime?
+  createdAt            DateTime        @default(now())
+  updatedAt            DateTime        @updatedAt
+  playlists            PlaylistVideo[]
+  saved                SavedVideo[]
+
+  @@index([channelYoutubeId, publishedAt])
+  @@index([publishedAt])
+  @@map("videos")
+}
+
+model Playlist {
+  id                  String          @id @default(cuid())
+  youtubeId           String          @unique
+  channelYoutubeId    String
+  channelTitle        String
+  channelId           String?
+  channel             Channel?        @relation(fields: [channelId], references: [id], onDelete: SetNull)
+  title               String
+  description         String          @default("")
+  thumbnailUrl        String?
+  itemCount           Int?
+  publishedAt         DateTime?
+  itemsNextPageToken  String?
+  itemsExhausted      Boolean         @default(false)
+  dataSource          DataSource
+  fetchedAt           DateTime        @default(now())
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+  videos              PlaylistVideo[]
+  saved               SavedPlaylist[]
+
+  @@index([channelYoutubeId])
+  @@map("playlists")
+}
+
+model PlaylistVideo {
+  playlistId String
+  videoId    String
+  position   Int
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  video      Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@id([playlistId, videoId])
+  @@index([videoId])
+  @@map("playlist_videos")
+}
+
+// ─── Per-user activity ───────────────────────────────────────────────────
+model SearchHistory {
+  id               String       @id @default(cuid())
+  userId           String
+  clientSessionId  String?
+  query            String
+  searchType       SearchType
+  entityName       String?
+  channelYoutubeId String?
+  resultCount      Int          @default(0)
+  videosFound      Int          @default(0)
+  playlistsFound   Int          @default(0)
+  channelsFound    Int          @default(0)
+  source           SearchSource
+  status           SearchStatus
+  errorCode        String?
+  dataSource       DataSource
+  day              String // YYYY-MM-DD in the user's timezone at search time
+  createdAt        DateTime     @default(now())
+  user             User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([userId, day])
+  @@index([userId, channelYoutubeId])
+  @@map("search_history")
+}
+
+/// Which catalog records a user has encountered (keeps library pages private per user).
+model UserDiscovery {
+  userId      String
+  kind        EntityKind
+  youtubeId   String
+  firstSeenAt DateTime   @default(now())
+  lastSeenAt  DateTime   @default(now())
+  timesSeen   Int        @default(1)
+  user        User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, kind, youtubeId])
+  @@index([userId, kind, lastSeenAt])
+  @@map("user_discoveries")
+}
+
+model SavedVideo {
+  id        String   @id @default(cuid())
+  userId    String
+  videoId   String
+  note      String?
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  video     Video    @relation(fields: [videoId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, videoId])
+  @@map("saved_videos")
+}
+
+model SavedChannel {
+  id        String   @id @default(cuid())
+  userId    String
+  channelId String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  channel   Channel  @relation(fields: [channelId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, channelId])
+  @@map("saved_channels")
+}
+
+model SavedPlaylist {
+  id         String   @id @default(cuid())
+  userId     String
+  playlistId String
+  createdAt  DateTime @default(now())
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, playlistId])
+  @@map("saved_playlists")
+}
+
+model SavedResearch {
+  id        String            @id @default(cuid())
+  userId    String
+  kind      SavedResearchKind
+  title     String
+  query     String?
+  refId     String?
+  payload   Json?
+  createdAt DateTime          @default(now())
+  user      User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@map("saved_research")
+}
+
+/// Research workspace: a named collection of creators, videos and playlists for comparison.
+model ResearchSession {
+  id          String         @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items       ResearchItem[]
+
+  @@index([userId, updatedAt])
+  @@map("research_sessions")
+}
+
+model ResearchItem {
+  id           String          @id @default(cuid())
+  sessionId    String
+  kind         EntityKind
+  youtubeId    String
+  title        String
+  thumbnailUrl String?
+  addedAt      DateTime        @default(now())
+  session      ResearchSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@unique([sessionId, kind, youtubeId])
+  @@map("research_items")
+}
+
+model AiSession {
+  id        String      @id @default(cuid())
+  userId    String
+  title     String
+  day       String
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  user      User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  messages  AiMessage[]
+
+  @@index([userId, updatedAt])
+  @@map("ai_sessions")
+}
+
+model AiMessage {
+  id        String    @id @default(cuid())
+  sessionId String
+  role      String // "user" | "assistant"
+  content   String
+  engine    String?
+  payload   Json? // structured ResearchResult for assistant messages
+  createdAt DateTime  @default(now())
+  session   AiSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, createdAt])
+  @@map("ai_messages")
+}
+
+model AnalyticsEvent {
+  id                String       @id @default(cuid())
+  userId            String
+  type              EventType
+  day               String
+  channelYoutubeId  String?
+  channelTitle      String?
+  videoYoutubeId    String?
+  playlistYoutubeId String?
+  contentType       ContentType?
+  category          String?
+  videosFound       Int          @default(0)
+  playlistsFound    Int          @default(0)
+  channelsFound     Int          @default(0)
+  createdAt         DateTime     @default(now())
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, day])
+  @@index([userId, type, day])
+  @@map("analytics_events")
+}
+
+/// Date-wise activity counters (one row per user per day), updated as events happen.
+model CalendarActivity {
+  userId      String
+  day         String
+  searches    Int    @default(0)
+  creators    Int    @default(0)
+  videos      Int    @default(0)
+  playlists   Int    @default(0)
+  savedVideos Int    @default(0)
+  aiSessions  Int    @default(0)
+  aiQueries   Int    @default(0)
+  plays       Int    @default(0)
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, day])
+  @@map("calendar_activity")
+}
+
+/// Outbound API calls (YouTube quota units, web search, LLM) for quota tracking and status.
+model ApiUsage {
+  id        String   @id @default(cuid())
+  provider  String // youtube | web | openai
+  endpoint  String
+  units     Int      @default(1)
+  ok        Boolean
+  errorCode String?
+  day       String // UTC day (YouTube quota resets at midnight Pacific; UTC is shown as an approximation)
+  createdAt DateTime @default(now())
+
+  @@index([provider, day])
+  @@index([provider, createdAt])
+  @@map("api_usage")
+}
